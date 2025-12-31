@@ -15,7 +15,7 @@
 #include <Servo.h>
 #include "Ultrasound.h"
 
-typedef enum {   
+typedef enum {
   MODE_NULL,
   MODE_ROCKERANDGRAVITY,  /* 摇杆&重力控制 */
   MODE_RGB_ADJUST,        /* RGB调节 */
@@ -23,7 +23,8 @@ typedef enum {
   MODE_ULTRASOUND_SEND,   /* 发送超声波距离给上位机 */
   MODE_SERVO_CONTROL,     /* 机械爪控制 */
   MODE_VOLTAGE_SEND,      /* 发送电压值给APP */
-  MODE_AVOID              /* 避障 */
+  MODE_AVOID,             /* 避障 */
+  MODE_MOTOR_TEST         /* 电机测试 */
 } CarMode;
 
 typedef enum {   
@@ -46,6 +47,7 @@ static ReadVoltageState g_read = READ_VOLTAGE_ON;
 
 static uint8_t g_state = 8;         /* 接收的APP子指令 */
 static uint8_t avoid_flag = 0;      /* 避障模式开关标志位 */
+static uint8_t motor_test_flag = 0; /* 电机测试模式标志位 */
 static uint8_t rot_flag = 0;         /* 转向标志位 */
 static uint8_t beep_count = 0;      /* 蜂鸣器鸣响次数 */
 
@@ -61,10 +63,13 @@ static int last_voltage_send;
 static int real_voltage_send;
 static int error_voltage;
 
+/* 电机测试相关参数 */
+static int8_t test_motor_speeds[4] = {0, 0, 0, 0}; /* 测试模式下的电机速度 */
+
 static CRGB rgbs[1];
 String rec_data[4];                 /* 接收APP的发送数据 */
 
-char *charArray;
+const char *charArray;
 
 /* 引脚定义 */
 const static uint8_t ledPin = 2;
@@ -91,6 +96,7 @@ void Motor_Init(void);
 void Speed_Task(void);
 void Task_Dispatcher(void);
 void Servo_Data_Receive(void);
+void Motor_Test_Task(void);
 void Rockerandgravity_Task(void);
 void Voltage_Detection_Task(void);
 void PWM_Out(uint8_t PWM_Pin, int8_t DutyCycle);
@@ -114,8 +120,15 @@ void setup() {
 }
 
 void loop() {
-  Velocity_Controller(car_derection, speed_data, car_rot);
+  // 如果在电机测试模式，直接控制电机，不使用运动学解算
+  if(motor_test_flag == 1) {
+    Motors_Set(test_motor_speeds[0], test_motor_speeds[1], test_motor_speeds[2], test_motor_speeds[3]);
+  } else {
+    Velocity_Controller(car_derection, speed_data, car_rot);
+  }
+
   Task_Dispatcher();
+
   if(g_read == READ_VOLTAGE_ON)
   {
     Voltage_Detection();
@@ -152,32 +165,43 @@ void Task_Dispatcher(void)
       index++;      /* 更新索引 */
     }
     charArray = rec_data[0].c_str();      /* 转成C字符串形式 */
-    if(strcmp(charArray, "A") == 0 && avoid_flag == 0)  /* 命令判断  */ 
+    if(strcmp(charArray, "A") == 0 && avoid_flag == 0)  /* 命令判断  */
     {
+        motor_test_flag = 0;  // 退出电机测试模式
         g_mode = MODE_ROCKERANDGRAVITY;
     }
-    if(strcmp(charArray, "B") == 0 && avoid_flag == 0) 
+    if(strcmp(charArray, "B") == 0 && avoid_flag == 0)
     {
+      motor_test_flag = 0;  // 退出电机测试模式
       g_mode = MODE_RGB_ADJUST;
     }
-    if(strcmp(charArray, "C") == 0 && avoid_flag == 0) 
+    if(strcmp(charArray, "C") == 0 && avoid_flag == 0)
     {
+      motor_test_flag = 0;  // 退出电机测试模式
       g_mode = MODE_SPEED_CONTROL;
     }
-    if(strcmp(charArray, "E") == 0 && avoid_flag == 0) 
+    if(strcmp(charArray, "E") == 0 && avoid_flag == 0)
     {
+      motor_test_flag = 0;  // 退出电机测试模式
       g_mode = MODE_SERVO_CONTROL;
     }
-    if(strcmp(charArray, "D") == 0) 
+    if(strcmp(charArray, "D") == 0)
     {
       g_mode = MODE_ULTRASOUND_SEND;
-    } 
-    if(strcmp(charArray, "F") == 0) 
+    }
+    if(strcmp(charArray, "F") == 0)
     {
+      motor_test_flag = 0;  // 退出电机测试模式
       g_mode = MODE_AVOID;
       avoid_flag = 1;
       g_state = atoi(rec_data[1].c_str());
-    }    
+    }
+    if(strcmp(charArray, "G") == 0)  /* 电机测试命令 */
+    {
+      avoid_flag = 0;  // 退出避障模式
+      motor_test_flag = 1;  // 进入电机测试模式
+      g_mode = MODE_MOTOR_TEST;
+    }
   }
   if(g_mode == MODE_ROCKERANDGRAVITY)
   {
@@ -197,6 +221,11 @@ void Task_Dispatcher(void)
   if(g_mode == MODE_SERVO_CONTROL)
   {
     Servo_Data_Receive();
+    g_mode = MODE_NULL;
+  }
+  if(g_mode == MODE_MOTOR_TEST)
+  {
+    Motor_Test_Task();
     g_mode = MODE_NULL;
   }
   if(g_mode == MODE_ULTRASOUND_SEND)
@@ -385,6 +414,23 @@ void Servo_Data_Receive(void)
 {
   increase_angle = atoi(rec_data[1].c_str());
   myservo.write(default_angle + increase_angle);
+}
+
+/* 电机测试任务 */
+void Motor_Test_Task(void)
+{
+  uint8_t motor_id = (uint8_t)atoi(rec_data[1].c_str());  // 电机编号 0-3
+  int8_t speed = (int8_t)atoi(rec_data[2].c_str());       // 速度 -100到100
+
+  // 保存到全局数组，在loop中持续输出PWM
+  test_motor_speeds[0] = 0;
+  test_motor_speeds[1] = 0;
+  test_motor_speeds[2] = 0;
+  test_motor_speeds[3] = 0;
+
+  if(motor_id >= 0 && motor_id < 4) {
+    test_motor_speeds[motor_id] = speed;
+  }
 }
 
 /* 避障模式 */
