@@ -2,9 +2,9 @@
  * @file app_control_common.ino
  * @author Anonymity(Anonymity@hiwonder.com)
  * @brief APP遥控玩法（标准Z字形定义版本）
- * @version V2.0 - Standard Z-Pattern
+ * @version V2.1 - Standard Z-Pattern (Simplified)
  * @date 2024-04-26 (原版)
- * @date 2026-01-01 (标准Z字形改写)
+ * @date 2026-01-01 (标准Z字形改写 + 简化索引映射)
  *
  * @copyright Copyright (c) 2024
  *
@@ -13,11 +13,11 @@
  * ============================================================================
  * 轮子编号定义（标准Z字形 - ROS兼容）
  * ============================================================================
- * 标准逻辑索引：
- *   索引0 → 左前轮 (物理引脚9,  控制板M3)
- *   索引1 → 右前轮 (物理引脚10, 控制板M2)
- *   索引2 → 左后轮 (物理引脚6,  控制板M4)
- *   索引3 → 右后轮 (物理引脚11, 控制板M1)
+ * 标准Z字形索引定义：
+ *   索引0 → 左前轮 (引脚9,  控制板M3)
+ *   索引1 → 右前轮 (引脚10, 控制板M2)
+ *   索引2 → 左后轮 (引脚6,  控制板M4)
+ *   索引3 → 右后轮 (引脚11, 控制板M1)
  *
  * 小车俯视图（车头朝上）：
  *          车头方向(0°)
@@ -46,15 +46,11 @@
  *   Vθ = rot                    : 旋转速度（逆时针为正）
  *
  * ============================================================================
- * 索引映射关系
+ * 实现特性
  * ============================================================================
- * 标准索引 → 物理索引 → Arduino引脚 → 物理轮子
- *    0     →    1     →    9       → 左前轮
- *    1     →    0     →   10       → 右前轮
- *    2     →    2     →    6       → 左后轮
- *    3     →    3     →   11       → 右后轮
- *
- * 注意：电机测试模式(G命令)使用物理索引，与硬件接线直接对应
+ * - 引脚数组按标准Z字形索引排列，无需额外映射
+ * - 所有索引（运动学、电机测试）统一使用标准Z字形定义
+ * - 代码简洁，易于理解和维护
  * ============================================================================
  */
 
@@ -112,19 +108,19 @@ static int real_voltage_send;
 static int error_voltage;
 
 /* 电机测试相关参数 */
-static int8_t test_motor_speeds[4] = {0, 0, 0, 0}; /* 测试模式下的电机速度（物理索引） */
+static int8_t test_motor_speeds[4] = {0, 0, 0, 0}; /* 测试模式下的电机速度（标准Z字形索引） */
 
 static CRGB rgbs[1];
 String rec_data[4];                 /* 接收APP的发送数据 */
 
 const char *charArray;
 
-/* 引脚定义 - 物理硬件接线 */
+/* 引脚定义 - 按标准Z字形索引顺序 */
 const static uint8_t ledPin = 2;
 const static uint8_t buzzerPin = 3;
 const static uint8_t servoPin = 5;
-const static uint8_t motorpwmPin[4] = { 10, 9, 6, 11} ;        /* 物理索引：0=右前, 1=左前, 2=左后, 3=右后 */
-const static uint8_t motordirectionPin[4] = { 12, 8, 7, 13};
+const static uint8_t motorpwmPin[4] = { 9, 10, 6, 11} ;        /* 标准Z字形索引：0=左前, 1=右前, 2=左后, 3=右后 */
+const static uint8_t motordirectionPin[4] = { 8, 12, 7, 13};   /* 方向引脚对应PWM引脚顺序 */
 
 const static int pwmFrequency = 500;                /* PWM频率，单位是赫兹 */
 const static int period = 10000000 / pwmFrequency;  /* PWM周期，单位是微秒 */
@@ -169,10 +165,9 @@ void setup() {
 
 void loop() {
   // 如果在电机测试模式，直接控制电机，不使用运动学解算
-  // 注意：test_motor_speeds使用物理索引，需要转换为标准索引传递给Motors_Set
-  // 物理索引→标准索引映射: [0→1, 1→0, 2→2, 3→3]
+  // test_motor_speeds 使用标准Z字形索引，直接传递给 Motors_Set
   if(motor_test_flag == 1) {
-    Motors_Set(test_motor_speeds[1], test_motor_speeds[0], test_motor_speeds[2], test_motor_speeds[3]);
+    Motors_Set(test_motor_speeds[0], test_motor_speeds[1], test_motor_speeds[2], test_motor_speeds[3]);
   } else {
     Velocity_Controller(car_derection, speed_data, car_rot);
   }
@@ -420,6 +415,13 @@ void Voltage_Detection(void)
   uint32_t currentTime_ms;
   currentTime_ms = millis();
   voltage = analogRead(A3)*0.02989;   /* 电压计算 */
+
+  // 修复：每次检测时都更新 real_voltage_send，避免使用 setup() 时的异常初始值
+  int current_voltage = (int)(voltage * 1000);
+  if(abs(current_voltage - real_voltage_send) < 2000) {  // 电压变化不超过2V才更新（防止异常跳变）
+    real_voltage_send = current_voltage;
+  }
+
   if(real_voltage_send <= 7000)
   {
     if(g_warning != WARNING_RGB)
@@ -469,12 +471,11 @@ void Servo_Data_Receive(void)
 /* 电机测试任务 */
 void Motor_Test_Task(void)
 {
-  uint8_t motor_id = (uint8_t)atoi(rec_data[1].c_str());  // 电机编号 0-3 (物理索引)
+  uint8_t motor_id = (uint8_t)atoi(rec_data[1].c_str());  // 电机编号 0-3 (标准Z字形索引)
   int8_t speed = (int8_t)atoi(rec_data[2].c_str());       // 速度 -100到100
 
   // 保存到全局数组，在loop中持续输出PWM
-  // 注意：这里使用物理索引，直接对应硬件引脚
-  // motor_id=0 → 右前轮(引脚10), motor_id=1 → 左前轮(引脚9), etc.
+  // 使用标准Z字形索引: motor_id=0→左前, 1→右前, 2→左后, 3→右后
   test_motor_speeds[0] = 0;
   test_motor_speeds[1] = 0;
   test_motor_speeds[2] = 0;
@@ -577,41 +578,23 @@ void Velocity_Controller(uint16_t angle, uint8_t velocity,int8_t rot)
 }
 
 /**
- * @brief PWM与轮子转向设置函数（标准Z字形索引映射）
+ * @brief PWM与轮子转向设置函数（标准Z字形索引）
  * @param Motor_0   标准索引0的速度（左前轮）
  * @param Motor_1   标准索引1的速度（右前轮）
  * @param Motor_2   标准索引2的速度（左后轮）
  * @param Motor_3   标准索引3的速度（右后轮）
  * @retval None
  *
- * @note 本函数将标准Z字形索引映射到物理硬件索引
- *       标准索引 → 物理索引 → Arduino引脚 → 物理轮子
- *          0     →    1     →    9       → 左前轮
- *          1     →    0     →   10       → 右前轮
- *          2     →    2     →    6       → 左后轮
- *          3     →    3     →   11       → 右后轮
+ * @note 引脚数组已按标准Z字形索引排列，直接使用索引访问
+ *       索引0 → motorpwmPin[0]=9  → 左前轮
+ *       索引1 → motorpwmPin[1]=10 → 右前轮
+ *       索引2 → motorpwmPin[2]=6  → 左后轮
+ *       索引3 → motorpwmPin[3]=11 → 右后轮
  */
 void Motors_Set(int8_t Motor_0, int8_t Motor_1, int8_t Motor_2, int8_t Motor_3)
 {
   int8_t pwm_set[4];
   int8_t motors[4] = { Motor_0, Motor_1, Motor_2, Motor_3};  // 标准索引的速度值
-
-  /**
-   * 标准Z字形索引到物理硬件的映射数组
-   *
-   * 物理接线情况：
-   *   motorpwmPin[0]=10 → M2 → 右前轮
-   *   motorpwmPin[1]=9  → M3 → 左前轮
-   *   motorpwmPin[2]=6  → M4 → 左后轮
-   *   motorpwmPin[3]=11 → M1 → 右后轮
-   *
-   * 映射关系：
-   *   std_to_phy[0]=1 : 标准索引0(左前) → 物理索引1 (引脚9, 左前轮)
-   *   std_to_phy[1]=0 : 标准索引1(右前) → 物理索引0 (引脚10, 右前轮)
-   *   std_to_phy[2]=2 : 标准索引2(左后) → 物理索引2 (引脚6, 左后轮)
-   *   std_to_phy[3]=3 : 标准索引3(右后) → 物理索引3 (引脚11, 右后轮)
-   */
-  const static uint8_t std_to_phy[4] = { 1, 0, 2, 3 };
 
   /**
    * 标准Z字形定义下的基准方向数组
@@ -625,22 +608,20 @@ void Motors_Set(int8_t Motor_0, int8_t Motor_1, int8_t Motor_2, int8_t Motor_3)
    */
   bool direction[4] = { 0, 1, 0, 1 };
 
-  // 遍历标准索引，映射到物理索引
+  // 遍历标准索引，直接控制对应引脚
   for(uint8_t i = 0; i < 4; ++i)
   {
-    uint8_t phy_idx = std_to_phy[i];  // 获取物理索引
-
     // 根据速度正负决定最终方向
     bool final_direction = direction[i];
     if(motors[i] < 0) final_direction = !final_direction;
 
     // 计算PWM占空比（取绝对值）
-    if(motors[i] == 0) pwm_set[phy_idx] = 0;
-    else pwm_set[phy_idx] = abs(motors[i]);
+    if(motors[i] == 0) pwm_set[i] = 0;
+    else pwm_set[i] = abs(motors[i]);
 
-    // 写入物理引脚
-    digitalWrite(motordirectionPin[phy_idx], final_direction);
-    PWM_Out(motorpwmPin[phy_idx], pwm_set[phy_idx]);
+    // 写入引脚（索引直接对应引脚数组）
+    digitalWrite(motordirectionPin[i], final_direction);
+    PWM_Out(motorpwmPin[i], pwm_set[i]);
   }
 }
 
