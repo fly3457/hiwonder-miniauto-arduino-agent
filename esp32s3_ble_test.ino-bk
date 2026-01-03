@@ -1,0 +1,355 @@
+/**
+ * ESP32-S3-CAM BLE 测试程序
+ * 功能：创建 BLE Server，模拟原蓝牙模块功能
+ * 用途：测试 ESP32-S3 的 BLE 功能和 UUID 配置
+ *
+ * 硬件：ESP32-S3-CAM 开发板
+ * 开发环境：Arduino IDE 2.x
+ *
+ * 作者：AutoMini Project
+ * 日期：2026-01-02
+ */
+
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+// 注意：BLE2902 在新版本中已弃用，描述符会自动添加
+
+// ==================== 配置参数 ====================
+
+// BLE 设备名称（Android 扫描时显示的名称）
+#define BLE_DEVICE_NAME "MiniAuto-ESP32"
+
+// BLE 服务 UUID（需要在 Android 端配置）
+#define SERVICE_UUID "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+
+// BLE 特征 UUID（用于数据收发）
+#define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+
+// 串口波特率
+#define SERIAL_BAUD 115200
+
+// LED 指示灯引脚（ESP32-S3-CAM 板载 LED，可选）
+#define LED_PIN 2
+
+// ==================== 全局变量 ====================
+
+BLEServer *pServer = NULL;
+BLECharacteristic *pCharacteristic = NULL;
+bool deviceConnected = false;
+bool oldDeviceConnected = false;
+
+// ==================== 函数前置声明 ====================
+
+void handleCommand(String command);
+
+// ==================== BLE 回调类 ====================
+
+// 服务器连接回调
+class MyServerCallbacks: public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) {
+    deviceConnected = true;
+    digitalWrite(LED_PIN, HIGH);  // LED 亮，表示已连接
+    Serial.println("\n========================================");
+    Serial.println("[BLE] ✓ 客户端已连接成功！");
+    Serial.println("[提示] 现在可以发送命令进行测试");
+    Serial.println("========================================\n");
+  }
+
+  void onDisconnect(BLEServer* pServer) {
+    deviceConnected = false;
+    digitalWrite(LED_PIN, LOW);  // LED 灭，表示断开
+    Serial.println("\n[BLE] ✗ 客户端已断开\n");
+  }
+};
+
+// 特征值写入回调
+class MyCharacteristicCallbacks: public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *pCharacteristic) {
+    Serial.println("[DEBUG] onWrite 回调被触发");  // 调试信息
+
+    // 使用最兼容的方法获取数据
+    uint8_t* pData = pCharacteristic->getData();
+    size_t len = pCharacteristic->getLength();
+
+    Serial.print("[DEBUG] 数据长度: ");
+    Serial.println(len);
+
+    // 转换为 Arduino String
+    String value = "";
+    for (size_t i = 0; i < len; i++) {
+      value += (char)pData[i];
+    }
+
+    Serial.print("[DEBUG] String 长度: ");
+    Serial.println(value.length());
+
+    if (value.length() > 0) {
+      Serial.print("[BLE] 收到数据: '");
+      Serial.print(value);
+      Serial.println("'");
+
+      // 打印十六进制数据（调试用）
+      Serial.print("[DEBUG] 十六进制: ");
+      for (size_t i = 0; i < value.length(); i++) {
+        Serial.print((byte)value[i], HEX);
+        Serial.print(" ");
+      }
+      Serial.println();
+
+      // 解析并处理命令
+      handleCommand(value);
+    } else {
+      Serial.println("[DEBUG] 收到空数据");
+    }
+  }
+};
+
+// ==================== 命令处理函数 ====================
+
+void handleCommand(String command) {
+  Serial.print("[命令解析] ");
+
+  // 测试阶段：解析命令类型并打印
+  if (command.startsWith("A|")) {
+    Serial.println("运动控制命令");
+    Serial.println("  格式: A|state|$");
+
+    // 提取状态参数
+    int firstPipe = command.indexOf('|');
+    int secondPipe = command.indexOf('|', firstPipe + 1);
+    if (secondPipe > firstPipe) {
+      String state = command.substring(firstPipe + 1, secondPipe);
+      Serial.print("  状态码: ");
+      Serial.println(state);
+    }
+  }
+  else if (command.startsWith("B|")) {
+    Serial.println("RGB 灯光控制命令");
+    Serial.println("  格式: B|r|g|b|$");
+
+    // 提取 RGB 参数
+    int pipe1 = command.indexOf('|');
+    int pipe2 = command.indexOf('|', pipe1 + 1);
+    int pipe3 = command.indexOf('|', pipe2 + 1);
+    int pipe4 = command.indexOf('|', pipe3 + 1);
+
+    if (pipe4 > pipe3) {
+      String r = command.substring(pipe1 + 1, pipe2);
+      String g = command.substring(pipe2 + 1, pipe3);
+      String b = command.substring(pipe3 + 1, pipe4);
+      Serial.print("  R: ");
+      Serial.print(r);
+      Serial.print(", G: ");
+      Serial.print(g);
+      Serial.print(", B: ");
+      Serial.println(b);
+    }
+  }
+  else if (command.startsWith("C|")) {
+    Serial.println("速度控制命令");
+    Serial.println("  格式: C|speed|$");
+
+    int firstPipe = command.indexOf('|');
+    int secondPipe = command.indexOf('|', firstPipe + 1);
+    if (secondPipe > firstPipe) {
+      String speed = command.substring(firstPipe + 1, secondPipe);
+      Serial.print("  速度: ");
+      Serial.println(speed);
+    }
+  }
+  else if (command.startsWith("D|")) {
+    Serial.println("请求电压和距离数据");
+
+    // 模拟返回数据：$distance,voltage$
+    String responseData = "$150,7400$";  // 距离150mm, 电压7400mV
+
+    pCharacteristic->setValue(responseData.c_str());
+    pCharacteristic->notify();  // 通知 Android 端
+
+    Serial.print("  [BLE] 发送数据: ");
+    Serial.println(responseData);
+  }
+  else if (command.startsWith("E|")) {
+    Serial.println("舵机控制命令");
+    Serial.println("  格式: E|angle|$");
+
+    int firstPipe = command.indexOf('|');
+    int secondPipe = command.indexOf('|', firstPipe + 1);
+    if (secondPipe > firstPipe) {
+      String angle = command.substring(firstPipe + 1, secondPipe);
+      Serial.print("  角度: ");
+      Serial.println(angle);
+    }
+  }
+  else if (command.startsWith("F|")) {
+    Serial.println("避障模式控制命令");
+    Serial.println("  格式: F|state|$");
+
+    int firstPipe = command.indexOf('|');
+    int secondPipe = command.indexOf('|', firstPipe + 1);
+    if (secondPipe > firstPipe) {
+      String state = command.substring(firstPipe + 1, secondPipe);
+      Serial.print("  状态: ");
+      Serial.println(state.equals("1") ? "开启" : "关闭");
+    }
+  }
+  else {
+    Serial.println("未知命令");
+    Serial.print("  原始数据: ");
+    Serial.println(command);
+  }
+
+  Serial.println();
+}
+
+// ==================== 初始化函数 ====================
+
+void setup() {
+  // 初始化 LED 指示灯（先初始化 LED，方便调试）
+  pinMode(LED_PIN, OUTPUT);
+
+  // LED 快速闪烁 5 次表示程序开始运行
+  for (int i = 0; i < 5; i++) {
+    digitalWrite(LED_PIN, HIGH);
+    delay(100);
+    digitalWrite(LED_PIN, LOW);
+    delay(100);
+  }
+
+  // 初始化串口
+  Serial.begin(SERIAL_BAUD);
+
+  // 等待 USB CDC 准备就绪（ESP32-S3 特有）
+  unsigned long startTime = millis();
+  while (!Serial && (millis() - startTime < 5000)) {
+    // 等待时让 LED 慢闪，表示在等待串口
+    digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+    delay(100);
+  }
+
+  digitalWrite(LED_PIN, LOW);
+  delay(500);
+
+  // 发送大量换行，确保串口监视器能看到
+  for (int i = 0; i < 10; i++) {
+    Serial.println();
+  }
+
+  Serial.println(">>>>>>>>>> 串口测试开始 <<<<<<<<<<");
+  Serial.println(">>>>>>>>>> 串口测试开始 <<<<<<<<<<");
+  Serial.println(">>>>>>>>>> 串口测试开始 <<<<<<<<<<");
+  Serial.println();
+
+  Serial.println("\n==================================");
+  Serial.println("  ESP32-S3-CAM BLE 测试程序");
+  Serial.println("  MiniAuto 小车项目");
+  Serial.println("==================================\n");
+
+  // 初始化 BLE 设备
+  Serial.println("[初始化] 正在初始化 BLE...");
+  BLEDevice::init(BLE_DEVICE_NAME);
+
+  // 创建 BLE Server
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  // 创建 BLE Service
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+
+  // 创建 BLE Characteristic（支持读/写/通知）
+  // 添加 WRITE_NR (Write No Response) 以确保兼容性
+  pCharacteristic = pService->createCharacteristic(
+    CHARACTERISTIC_UUID,
+    BLECharacteristic::PROPERTY_READ   |
+    BLECharacteristic::PROPERTY_WRITE  |
+    BLECharacteristic::PROPERTY_WRITE_NR |
+    BLECharacteristic::PROPERTY_NOTIFY
+  );
+
+  // 注意：新版本 ESP32 BLE 库会自动添加 2902 描述符，无需手动添加
+  // pCharacteristic->addDescriptor(new BLE2902());  // 已弃用
+
+  // 设置写入回调
+  pCharacteristic->setCallbacks(new MyCharacteristicCallbacks());
+
+  Serial.println("[初始化] 特征回调已设置");
+
+  // 启动服务
+  pService->start();
+
+  // 启动广播
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setScanResponse(true);
+  pAdvertising->setMinPreferred(0x06);  // 帮助 iPhone 连接
+  pAdvertising->setMinPreferred(0x12);
+  BLEDevice::startAdvertising();
+
+  Serial.println("[初始化] BLE 设备已启动！");
+  Serial.println("\n[配置信息]");
+  Serial.print("  设备名称: ");
+  Serial.println(BLE_DEVICE_NAME);
+  Serial.print("  服务UUID: ");
+  Serial.println(SERVICE_UUID);
+  Serial.print("  特征UUID: ");
+  Serial.println(CHARACTERISTIC_UUID);
+  Serial.println("\n[提示] 请使用 Android 端扫描并连接此设备");
+  Serial.println("[提示] 或使用 nRF Connect 等 BLE 工具测试\n");
+
+  // LED 闪烁 3 次表示初始化完成
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(LED_PIN, HIGH);
+    delay(200);
+    digitalWrite(LED_PIN, LOW);
+    delay(200);
+  }
+
+  // 最终启动完成提示
+  Serial.println("\n╔════════════════════════════════════════╗");
+  Serial.println("║  ✓✓✓ 初始化完成！程序开始运行 ✓✓✓  ║");
+  Serial.println("║     等待蓝牙连接...                  ║");
+  Serial.println("╚════════════════════════════════════════╝\n");
+}
+
+// ==================== 主循环 ====================
+
+void loop() {
+  // 每 5 秒打印一次心跳（证明程序在运行）
+  static unsigned long lastHeartbeat = 0;
+  if (millis() - lastHeartbeat > 5000) {
+    Serial.println("========================================");
+    Serial.print("[心跳] 程序运行中... 运行时间: ");
+    Serial.print(millis() / 1000);
+    Serial.println(" 秒");
+    Serial.print("[状态] 连接状态: ");
+    Serial.println(deviceConnected ? "已连接" : "未连接");
+    Serial.println("========================================");
+    lastHeartbeat = millis();
+  }
+
+  // 处理断开连接后的重新广播
+  if (!deviceConnected && oldDeviceConnected) {
+    delay(500);  // 给蓝牙栈时间准备
+    pServer->startAdvertising();  // 重新开始广播
+    Serial.println("[BLE] 正在等待新的连接...");
+    oldDeviceConnected = deviceConnected;
+  }
+
+  // 处理新连接（在 loop 中也打印连接信息）
+  if (deviceConnected && !oldDeviceConnected) {
+    Serial.println("\n!!! [LOOP] 检测到新连接 !!!\n");
+    oldDeviceConnected = deviceConnected;
+  }
+
+  // 心跳指示（连接时 LED 慢闪）
+  static unsigned long lastBlink = 0;
+  if (deviceConnected) {
+    if (millis() - lastBlink > 2000) {
+      digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+      lastBlink = millis();
+    }
+  }
+
+  delay(10);
+}

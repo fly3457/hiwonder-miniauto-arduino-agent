@@ -32,18 +32,18 @@
  * 坐标系定义：
  *   X轴 = 车头方向（前进为正）
  *   Y轴 = 车身左侧方向（左移为正）
- *   用户angle定义：0°=前进，90°=右移，逆时针为正
+ *   用户angle定义：0°=前进，90°=左移，逆时针为正（标准ROS右手系）
  *
- * 运动学公式：
- *   V_左前(0) = Vx + Vy - Vθ
- *   V_右前(1) = Vx - Vy + Vθ
- *   V_左后(2) = Vx - Vy - Vθ
- *   V_右后(3) = Vx + Vy + Vθ
+ * 运动学公式（符合ROS标准右手坐标系）：
+ *   V_左前(0) = Vx + Vy + Vθ
+ *   V_右前(1) = Vx - Vy - Vθ
+ *   V_左后(2) = Vx - Vy + Vθ
+ *   V_右后(3) = Vx + Vy - Vθ
  *
  * 其中：
  *   Vx = velocity * cos(-angle) : 前进速度分量
  *   Vy = velocity * sin(-angle) : 横移速度分量（左为正）
- *   Vθ = rot                    : 旋转速度（逆时针为正）
+ *   Vθ = rot                    : 旋转速度（正值=逆时针，符合ROS右手系）
  *
  * ============================================================================
  * 实现特性
@@ -58,6 +58,26 @@
 #include "FastLED.h"
 #include <Servo.h>
 #include "Ultrasound.h"
+#include <Wire.h>  // I2C库
+
+// I2C 配置
+#define I2C_ESP32_ADDR 0x52  // ESP32-S3 的 I2C 从机地址 (官方地址,与ESP32CAM程序一致)
+#define I2C_POLL_INTERVAL 10  // 轮询ESP32的间隔 (毫秒) - 优化: 从50ms降至10ms
+#define I2C_DEBUG_INTERVAL 5000  // 调试信息打印间隔 (毫秒)
+#define I2C_HELLO_INTERVAL 5000  // 发送hello的间隔 (毫秒)
+
+// I2C 接收缓冲区
+#define I2C_BUFFER_SIZE 64
+char i2c_rx_buffer[I2C_BUFFER_SIZE];
+unsigned long last_i2c_poll = 0;
+unsigned long last_i2c_debug = 0;
+unsigned long last_i2c_hello = 0;  // hello发送计时
+
+// I2C 统计信息
+unsigned long i2c_total_polls = 0;      // 总轮询次数
+unsigned long i2c_success_reads = 0;    // 成功读取次数
+unsigned long i2c_hello_sent = 0;       // hello发送次数
+String last_received_cmd = "";          // 最后接收的命令
 
 typedef enum {
   MODE_NULL,
@@ -110,6 +130,12 @@ static int error_voltage;
 /* 电机测试相关参数 */
 static int8_t test_motor_speeds[4] = {0, 0, 0, 0}; /* 测试模式下的电机速度（标准Z字形索引） */
 
+/* 电机校准系数（用于补偿硬件个体差异）*/
+/* 标准Z字形索引：0=左前, 1=右前, 2=左后, 3=右后 */
+/* 使用方法：通过实际测试调整系数，使小车直线移动不跑偏 */
+/* 例如：如果前进时向左偏，说明右侧轮速度过慢，需要增大右侧系数 */
+static float motor_calibration[4] = {1.0, 1.0, 1.0, 1.0};
+
 static CRGB rgbs[1];
 String rec_data[4];                 /* 接收APP的发送数据 */
 
@@ -148,8 +174,46 @@ void Rgb_Show(uint8_t rValue,uint8_t gValue,uint8_t bValue);
 void Velocity_Controller(uint16_t angle, uint8_t velocity,int8_t rot);
 void Motors_Set(int8_t Motor_0, int8_t Motor_1, int8_t Motor_2, int8_t Motor_3);
 
+// I2C 功能函数
+void pollESP32Command(void);
+void sendHelloToESP32(void);
+
 void setup() {
   Serial.begin(9600);
+
+  // 初始化 I2C (主机模式)
+  Wire.begin();  // Arduino UNO 作为主机
+  Serial.println("[I2C] Arduino 初始化为 I2C 主机");
+  Serial.print("[I2C] ESP32 从机地址: 0x");
+  Serial.println(I2C_ESP32_ADDR, HEX);
+
+  // 扫描 I2C 总线上的所有设备
+  Serial.println("\n[I2C扫描] 正在扫描I2C总线...");
+  bool found = false;
+  for (byte addr = 1; addr < 127; addr++) {
+    Wire.beginTransmission(addr);
+    byte error = Wire.endTransmission();
+    if (error == 0) {
+      Serial.print("  找到设备: 0x");
+      if (addr < 16) Serial.print("0");
+      Serial.print(addr, HEX);
+
+      // 识别常见设备
+      if (addr == I2C_ESP32_ADDR) {
+        Serial.print(" (ESP32-S3)");
+      } else if (addr >= 0x70 && addr <= 0x77) {
+        Serial.print(" (可能是超声波/传感器)");
+      }
+      Serial.println();
+      found = true;
+    }
+  }
+  if (!found) {
+    Serial.println("  ⚠ 警告: 未找到任何I2C设备!");
+  } else {
+    Serial.println("[I2C扫描] 扫描完成\n");
+  }
+
   FastLED.addLeds<WS2812, ledPin, RGB>(rgbs, 1);
   Motor_Init();
   pinMode(servoPin, OUTPUT);
@@ -161,9 +225,38 @@ void setup() {
   voltage_send = analogRead(A3)*0.02989*1000;   /* 电压计算 */
   last_voltage_send = voltage_send;
   real_voltage_send = voltage_send;
+
+  Serial.println("[启动] Arduino UNO 已就绪");
+  Serial.println("[提示] 将每隔 50ms 轮询 ESP32 获取 BLE 命令...");
 }
 
 void loop() {
+  // 【已禁用】每隔5秒发送hello给ESP32
+  // 原因：hello消息会干扰寄存器协议，导致寄存器地址被误设为 'h'(0x68)
+  // sendHelloToESP32();
+
+  // 轮询 ESP32 获取命令
+  pollESP32Command();
+
+  // 定时打印I2C调试信息
+  if (millis() - last_i2c_debug >= I2C_DEBUG_INTERVAL) {
+    last_i2c_debug = millis();
+    Serial.println("\n========== I2C 状态报告 ==========");
+    Serial.print("Hello发送次数: ");
+    Serial.println(i2c_hello_sent);
+    Serial.print("总轮询次数: ");
+    Serial.println(i2c_total_polls);
+    Serial.print("成功读取次数: ");
+    Serial.println(i2c_success_reads);
+    if (last_received_cmd.length() > 0) {
+      Serial.print("最后收到命令: ");
+      Serial.println(last_received_cmd);
+    } else {
+      Serial.println("最后收到命令: (无)");
+    }
+    Serial.println("==================================\n");
+  }
+
   // 如果在电机测试模式，直接控制电机，不使用运动学解算
   // test_motor_speeds 使用标准Z字形索引，直接传递给 Motors_Set
   if(motor_test_flag == 1) {
@@ -314,42 +407,42 @@ void Rockerandgravity_Task(void)
   switch (g_state)
   {
     case 0:
-      car_derection = 90;
+      car_derection = 270;  // 右移（-90° = 270°）
       // car_rot = 0;
       speed_data = speed_update;
       break;
     case 1:
-      car_derection = 45;
+      car_derection = 315;  // 右前（-45° = 315°）
       // car_rot = 0;
       speed_data = speed_update;
       break;
     case 2:
-      car_derection = 0;
+      car_derection = 0;  // 前进（0°）
       // car_rot = 0;
       speed_data = speed_update;
       break;
     case 3:
-      car_derection = 315;
+      car_derection = 45;  // 左前（45°）
       // car_rot = 0;
       speed_data = speed_update;
       break;
     case 4:
-      car_derection = 270;
+      car_derection = 90;  // 左移（90°）
       // car_rot = 0;
       speed_data = speed_update;
       break;
     case 5:
-      car_derection = 225;
+      car_derection = 135;  // 左后（135°）
       // car_rot = 0;
       speed_data = speed_update;
       break;
     case 6:
-      car_derection = 180;
+      car_derection = 180;  // 后退（180°）
       // car_rot = 0;
       speed_data = speed_update;
       break;
     case 7:
-      car_derection = 135;
+      car_derection = 225;  // 右后（225°）
       // car_rot = 0;
       speed_data = speed_update;
       break;
@@ -553,26 +646,32 @@ void Velocity_Controller(uint16_t angle, uint8_t velocity,int8_t rot)
   float speed = 1;
 
   // 标准坐标系：X轴=车头方向(前进)，Y轴=车身左侧方向(左移)
-  // 用户angle定义：0°=前进，90°=右移，逆时针为正
+  // 用户angle定义：0°=前进，90°=左移，逆时针为正（标准ROS右手系）
   // 数学坐标系转换：取负号将用户的"逆时针为正"转为标准的"右手坐标系"
   float rad = -angle * PI / 180;
 
-  // 速度因子调整（旋转时降速50%）
-  if (rot == 0) speed = 1;
-  else speed = 0.5;
-
-  // 速度归一化（考虑麦轮45°滚轮角度）
-  velocity /= sqrt(2);
-
-  // 分解速度分量
+  // 分解速度分量（不做提前归一化，保持原始速度比例）
   float Vx = velocity * cos(rad);  // 前进速度分量（前为正）
   float Vy = velocity * sin(rad);  // 横移速度分量（左为正）
 
-  // 标准Z字形麦克纳姆轮运动学逆解公式（适配当前硬件）
-  velocity_0 = (Vx + Vy) * speed - rot * speed;  // 左前轮
-  velocity_1 = (Vx - Vy) * speed + rot * speed;  // 右前轮
-  velocity_2 = (Vx - Vy) * speed - rot * speed;  // 左后轮
-  velocity_3 = (Vx + Vy) * speed + rot * speed;  // 右后轮
+  // 标准Z字形麦克纳姆轮运动学逆解公式（符合ROS标准定义）
+  // 旋转方向定义：正值=逆时针旋转（符合右手坐标系）
+  velocity_0 = (int8_t)(Vx + Vy + rot);  // 左前轮
+  velocity_1 = (int8_t)(Vx - Vy - rot);  // 右前轮
+  velocity_2 = (int8_t)(Vx - Vy + rot);  // 左后轮
+  velocity_3 = (int8_t)(Vx + Vy - rot);  // 右后轮
+
+  // 输出端归一化：防止任何轮子速度超过±100
+  float max_vel = max(abs(velocity_0), max(abs(velocity_1),
+                      max(abs(velocity_2), abs(velocity_3))));
+
+  if(max_vel > 100) {
+    float scale = 100.0 / max_vel;
+    velocity_0 = (int8_t)(velocity_0 * scale);
+    velocity_1 = (int8_t)(velocity_1 * scale);
+    velocity_2 = (int8_t)(velocity_2 * scale);
+    velocity_3 = (int8_t)(velocity_3 * scale);
+  }
 
   Motors_Set(velocity_0, velocity_1, velocity_2, velocity_3);
 }
@@ -594,7 +693,14 @@ void Velocity_Controller(uint16_t angle, uint8_t velocity,int8_t rot)
 void Motors_Set(int8_t Motor_0, int8_t Motor_1, int8_t Motor_2, int8_t Motor_3)
 {
   int8_t pwm_set[4];
-  int8_t motors[4] = { Motor_0, Motor_1, Motor_2, Motor_3};  // 标准索引的速度值
+
+  // 应用电机校准系数（标准Z字形索引）
+  int8_t motors[4] = {
+    (int8_t)(Motor_0 * motor_calibration[0]),
+    (int8_t)(Motor_1 * motor_calibration[1]),
+    (int8_t)(Motor_2 * motor_calibration[2]),
+    (int8_t)(Motor_3 * motor_calibration[3])
+  };
 
   /**
    * 标准Z字形定义下的基准方向数组
@@ -640,5 +746,159 @@ void PWM_Out(uint8_t PWM_Pin, int8_t DutyCycle)
   if (currentTime_us - previousTime_us >= period)
   {
     previousTime_us = currentTime_us;
+  }
+}
+
+// ==================== I2C 主机轮询功能 ====================
+
+/**
+ * @brief 每隔5秒发送hello给ESP32从机
+ */
+void sendHelloToESP32(void) {
+  if (millis() - last_i2c_hello < I2C_HELLO_INTERVAL) {
+    return;  // 未到发送时间
+  }
+  last_i2c_hello = millis();
+
+  String hello_msg = "hello from Arduino";
+
+  Wire.beginTransmission(I2C_ESP32_ADDR);
+  Wire.write(hello_msg.c_str());
+  byte error = Wire.endTransmission();
+
+  i2c_hello_sent++;
+
+  if (error == 0) {
+    Serial.print("[I2C] 成功发送 hello (");
+    Serial.print(i2c_hello_sent);
+    Serial.println(")");
+  } else {
+    Serial.print("[I2C] 发送 hello 失败，错误码: ");
+    Serial.println(error);
+  }
+}
+
+/**
+ * @brief 轮询ESP32-S3从机获取命令（使用寄存器协议）
+ * @note 每隔10ms从ESP32读取BLE命令，同时主动上报传感器数据
+ *       寄存器0x10: BLE命令数据
+ *       寄存器0x11: 传感器数据上报 (距离2字节 + 电压2字节)
+ */
+void pollESP32Command(void) {
+  // 定时轮询
+  if (millis() - last_i2c_poll < I2C_POLL_INTERVAL) {
+    return;  // 未到轮询时间
+  }
+  last_i2c_poll = millis();
+  i2c_total_polls++;  // 统计轮询次数
+
+  // ========== 步骤0: 主动上报传感器数据到ESP32 ==========
+  // 每次轮询时都将最新的距离和电压数据发送给ESP32
+  // 数据格式: [寄存器地址0x11] [distance高字节] [distance低字节] [voltage高字节] [voltage低字节]
+  Wire.beginTransmission(I2C_ESP32_ADDR);
+  Wire.write(0x11);  // 传感器数据寄存器
+  Wire.write((uint8_t)(distance >> 8));           // 距离高字节
+  Wire.write((uint8_t)(distance & 0xFF));         // 距离低字节
+  Wire.write((uint8_t)(real_voltage_send >> 8));  // 电压高字节
+  Wire.write((uint8_t)(real_voltage_send & 0xFF));// 电压低字节
+  byte sensor_error = Wire.endTransmission();
+
+  // 如果传感器数据发送失败，跳过本次命令读取（ESP32可能不在线）
+  if (sensor_error != 0) {
+    return;
+  }
+
+  // ========== 步骤1: 发送寄存器地址 0x10 (BLE命令寄存器) ==========
+  Wire.beginTransmission(I2C_ESP32_ADDR);
+  Wire.write(0x10);  // 寄存器地址
+  byte error = Wire.endTransmission();
+
+  if (error != 0) {
+    // 发送寄存器地址失败
+    return;
+  }
+
+  // ========== 步骤2: 请求读取命令数据（请求16字节，优化：从32减至16） ==========
+  // 注意：ESP32实际只发送命令的实际长度（如11字节），但Arduino必须指定请求字节数
+  // 最长指令B|255|255|255|$=15字节+'\0'=16字节，因此16字节足够
+  uint8_t bytesReceived = Wire.requestFrom((int)I2C_ESP32_ADDR, 16);
+
+  if (bytesReceived == 0) {
+    // ESP32没有数据
+    return;
+  }
+
+  // 读取数据到缓冲区
+  uint8_t index = 0;
+  while (Wire.available() && index < I2C_BUFFER_SIZE - 1) {
+    i2c_rx_buffer[index++] = Wire.read();
+  }
+  i2c_rx_buffer[index] = '\0';  // 添加字符串结束符
+
+  // 如果收到空数据(只有一个0字节),忽略
+  if (index == 0 || (index == 1 && i2c_rx_buffer[0] == 0)) {
+    return;
+  }
+
+  // 记录统计信息
+  i2c_success_reads++;
+  last_received_cmd = String(i2c_rx_buffer);
+
+  // 调试输出 - 已禁用以提升性能（优化：删除250ms延迟）
+  // Serial.print("[I2C] 从 ESP32 收到命令: ");
+  // Serial.println(i2c_rx_buffer);
+  // Serial.print("[I2C] 十六进制: ");
+  // for(uint8_t i = 0; i < index && i < 20; i++) {
+  //   if(i2c_rx_buffer[i] < 16) Serial.print("0");
+  //   Serial.print((uint8_t)i2c_rx_buffer[i], HEX);
+  //   Serial.print(" ");
+  // }
+  // Serial.println();
+
+  // 解析命令并设置模式 (复制自原Task_Dispatcher)
+  String cmd = String(i2c_rx_buffer);
+  uint8_t parse_index = 0;
+
+  while (cmd.indexOf('|') != -1 && parse_index < 4)
+  {
+    rec_data[parse_index] = cmd.substring(0, cmd.indexOf('|'));
+    cmd = cmd.substring(cmd.indexOf('|') + 1);
+    parse_index++;
+  }
+
+  if (parse_index > 0) {
+    charArray = rec_data[0].c_str();
+
+    // 命令判断逻辑
+    if(strcmp(charArray, "A") == 0 && avoid_flag == 0) {
+      motor_test_flag = 0;
+      g_mode = MODE_ROCKERANDGRAVITY;
+    }
+    if(strcmp(charArray, "B") == 0 && avoid_flag == 0) {
+      motor_test_flag = 0;
+      g_mode = MODE_RGB_ADJUST;
+    }
+    if(strcmp(charArray, "C") == 0 && avoid_flag == 0) {
+      motor_test_flag = 0;
+      g_mode = MODE_SPEED_CONTROL;
+    }
+    if(strcmp(charArray, "E") == 0 && avoid_flag == 0) {
+      motor_test_flag = 0;
+      g_mode = MODE_SERVO_CONTROL;
+    }
+    if(strcmp(charArray, "D") == 0) {
+      g_mode = MODE_ULTRASOUND_SEND;
+    }
+    if(strcmp(charArray, "F") == 0) {
+      motor_test_flag = 0;
+      g_mode = MODE_AVOID;
+      avoid_flag = 1;
+      g_state = atoi(rec_data[1].c_str());
+    }
+    if(strcmp(charArray, "G") == 0) {
+      avoid_flag = 0;
+      motor_test_flag = 1;
+      g_mode = MODE_MOTOR_TEST;
+    }
   }
 }
