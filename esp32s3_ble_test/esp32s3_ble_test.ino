@@ -153,6 +153,10 @@ class MyCharacteristicCallbacks: public BLECharacteristicCallbacks {
  * @note Arduino发送两种数据:
  *       1. 寄存器地址 (0x10=命令, 0x11=传感器数据)
  *       2. 传感器数据 (寄存器0x11后跟4字节: distance高低+voltage高低)
+ *
+ * ⭐ P2优化: 收到Arduino主动上报的传感器数据后，立即BLE notify给Android
+ * 优化前: 传感器数据存储后等待Android请求D命令 (延迟最高200ms)
+ * 优化后: 收到数据立即notify (延迟<1ms，取消D命令定时发送)
  */
 void onI2CReceive(int howMany) {
   i2c_receive_count = i2c_receive_count + 1;  // 避免volatile警告
@@ -171,6 +175,13 @@ void onI2CReceive(int howMany) {
       // 合并为16位数据
       latest_distance = (dist_h << 8) | dist_l;
       latest_voltage = (volt_h << 8) | volt_l;
+
+      // ⭐ P2优化: 立即通过BLE通知Android端 (无需等待D命令)
+      if (deviceConnected && pCharacteristic != NULL) {
+        String responseData = "$" + String(latest_distance) + "," + String(latest_voltage) + "$";
+        pCharacteristic->setValue(responseData.c_str());
+        pCharacteristic->notify();  // 主动推送给Android
+      }
     }
     // 寄存器0x10: 命令寄存器标记
     else if (reg == 0x10) {
