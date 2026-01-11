@@ -43,7 +43,7 @@
 #define CHARACTERISTIC_UUID "0000FFE1-0000-1000-8000-00805F9B34FB"
 
 // 串口波特率
-#define SERIAL_BAUD 115200
+#define SERIAL_BAUD 230400
 
 // LED 指示灯引脚（ESP32-S3-CAM 板载 LED，可选）
 #define LED_PIN 2
@@ -252,6 +252,10 @@ void onI2CRequest() {
 /**
  * @brief 存储BLE收到的命令到环形队列 (支持停止指令优先级)
  * @param command 收到的命令字符串
+ *
+ * ⭐ 优化: 停止指令到达时清空普通队列 + 去重
+ * 方案1: 停止指令清空普通队列 - 防止停止后继续运动
+ * 方案2: 停止指令去重 - 避免多次停止占满优先队列
  */
 void storeCommand(String command) {
   total_commands_received++;  // 统计总接收数
@@ -261,8 +265,34 @@ void storeCommand(String command) {
     return;
   }
 
-  // ⭐ 优先级机制：检查是否是停止指令 A|8|$
+  // ⭐⭐⭐ 方案1+2: 检查是否是停止指令 A|8|$ ⭐⭐⭐
   if (command == "A|8|$") {
+
+    // ⭐ 方案1: 清空普通队列 (停止指令意味着立即停止，之前的运动指令都应作废)
+    if (cmdQueue.count > 0) {
+      Serial.print("[停止指令] 清空普通队列，丢弃 ");
+      Serial.print(cmdQueue.count);
+      Serial.print(" 条指令 (");
+      Serial.print(command);
+      Serial.println(")");
+    }
+    cmdQueue.head = 0;
+    cmdQueue.tail = 0;
+    cmdQueue.count = 0;
+
+    // ⭐ 方案2: 停止指令去重 (优先队列中只保留1条最新的停止指令)
+    if (priorityQueue.count > 0) {
+      // 检查最后一条是否也是相同的停止指令
+      uint8_t last_index = (priorityQueue.head - 1 + PRIORITY_QUEUE_SIZE) % PRIORITY_QUEUE_SIZE;
+      if (strcmp(priorityQueue.buffer[last_index], command.c_str()) == 0) {
+        // 已有相同的停止指令，不重复入队
+        Serial.print("[停止指令] 去重，忽略重复指令 (");
+        Serial.print(command);
+        Serial.println(")");
+        return;
+      }
+    }
+
     // 停止指令存入高优先级队列
     if (priorityQueue.count < PRIORITY_QUEUE_SIZE) {
       // 优先级队列未满，直接入队
@@ -270,6 +300,13 @@ void storeCommand(String command) {
       command.toCharArray(priorityQueue.buffer[priorityQueue.head], CMD_MAX_LEN);
       priorityQueue.head = (priorityQueue.head + 1) % PRIORITY_QUEUE_SIZE;
       priorityQueue.count++;
+
+      Serial.print("[停止指令] 入队成功 (");
+      Serial.print(command);
+      Serial.print("), 优先队列: ");
+      Serial.print(priorityQueue.count);
+      Serial.print("/");
+      Serial.println(PRIORITY_QUEUE_SIZE);
     } else {
       // 优先级队列已满（极端情况），强制覆盖最早的停止指令
       commands_dropped++;
@@ -280,6 +317,8 @@ void storeCommand(String command) {
       command.toCharArray(priorityQueue.buffer[priorityQueue.head], CMD_MAX_LEN);
       priorityQueue.head = (priorityQueue.head + 1) % PRIORITY_QUEUE_SIZE;
       priorityQueue.count++;
+
+      Serial.println("[警告] 优先队列已满，覆盖最早的停止指令");
     }
     return;  // 停止指令不进入普通队列
   }
