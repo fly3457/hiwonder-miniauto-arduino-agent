@@ -59,6 +59,7 @@
 // #include <Servo.h>  // ⭐ 已注释: 不使用舵机功能
 #include "Ultrasound.h"
 #include <Wire.h>  // I2C库
+#include "motor_speed_visual_test.h"  // ⭐ 电机转速视觉测试模块
 
 // I2C 配置
 #define I2C_ESP32_ADDR 0x52           // ESP32-S3 的 I2C 从机地址 (官方地址,与ESP32CAM程序一致)
@@ -278,6 +279,9 @@ void setup() {
 
   Serial.println("[启动] Arduino UNO 已就绪");
   Serial.println("[提示] 将每隔 50ms 轮询 ESP32 获取 BLE 命令...");
+  
+  // ⭐ 初始化电机转速视觉测试模块
+  VisualTest_Init();
 }
 
 void loop() {
@@ -293,6 +297,9 @@ void loop() {
 
   // ========== 步骤2: 任务调度和执行（包括电机控制） ==========
   Task_Dispatcher();     // 统一调度所有任务，包括电机控制
+  
+  // ⭐ 电机转速视觉测试任务（非阻塞）
+  VisualTest_Task();
 
   // ========== 步骤3: 传感器数据采样和上报（非阻塞） ==========
   sampleUltrasound();         // 每50ms采样一次超声波
@@ -996,6 +1003,34 @@ void pollSerialCommand(void) {
   while (Serial.available() > 0)
   {
     String cmd = Serial.readStringUntil('$');
+
+    // ⭐ 处理视觉测试命令（单个字符命令，不遵循标准格式）
+    if (cmd.length() == 1) {
+      char test_cmd = cmd.charAt(0);
+      switch (test_cmd) {
+        case 'V':
+        case 'v':
+          VisualTest_PrintBanner();
+          break;
+        case 'S':
+        case 's':
+          VisualTest_StartSingleWheel();
+          break;
+        case 'Y':
+        case 'y':
+          VisualTest_StartSync();
+          break;
+        case 'T':
+        case 't':
+          VisualTest_StartTranslation();
+          break;
+        case 'X':
+        case 'x':
+          VisualTest_Stop();
+          break;
+      }
+      continue;  // 跳过标准命令处理
+    }
 
     while (cmd.indexOf('|') != -1)
     {
