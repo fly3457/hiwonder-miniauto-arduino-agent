@@ -821,10 +821,10 @@ void Motor_Init(void)
  *
  * @note 标准麦克纳姆轮运动学公式（适配当前硬件）：
  *       坐标系：X轴=车头方向(前进), Y轴=车身左侧方向(左移)
- *       velocity_0 (左前) = Vx + Vy + Vθ
- *       velocity_1 (右前) = Vx - Vy - Vθ
- *       velocity_2 (左后) = Vx - Vy + Vθ
- *       velocity_3 (右后) = Vx + Vy - Vθ
+ *       velocity_0 (左前) = Vx + Vy - Vθ
+ *       velocity_1 (右前) = Vx - Vy + Vθ
+ *       velocity_2 (左后) = Vx - Vy - Vθ
+ *       velocity_3 (右后) = Vx + Vy + Vθ
  */
 void Velocity_Controller(uint16_t angle, uint8_t velocity,int8_t rot)
 {
@@ -834,9 +834,9 @@ void Velocity_Controller(uint16_t angle, uint8_t velocity,int8_t rot)
   /* 坐标系转换：将用户角度转换为数学角度
    * 标准坐标系：X轴=车头方向(前进)，Y轴=车身左侧方向(左移)
    * 用户angle定义：0°=前进，90°=左移，逆时针为正（标准ROS右手系）
-   * 已修正：移除不必要的负号，直接使用angle计算
+   * 数学坐标系转换：取负号将用户的"逆时针为正"转为标准的"右手坐标系"
    * PI/180 将角度转换为弧度（三角函数需要弧度输入） */
-  float rad = angle * PI / 180;
+  float rad = -angle * PI / 180;
 
   /* 分解速度分量（不做提前归一化，保持原始速度比例）
    * cos(rad)和sin(rad)的范围是[-1, 1]，乘以velocity后得到速度分量 */
